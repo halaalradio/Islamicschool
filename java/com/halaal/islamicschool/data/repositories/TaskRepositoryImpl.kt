@@ -1,0 +1,110 @@
+package com.halaal.islamicschool.data.repositories
+
+import com.halaal.islamicschool.data.dataStore.DataStore
+import com.halaal.islamicschool.domain.dto.SourceDto
+import com.halaal.islamicschool.domain.dto.SubmissionDto
+import com.halaal.islamicschool.domain.models.Source
+import com.halaal.islamicschool.domain.models.Submission
+import com.halaal.islamicschool.domain.models.Task
+import com.halaal.islamicschool.domain.repositories.TaskRepository
+import com.halaal.islamicschool.domain.response.ApiResponse
+import com.zkrallah.zhttp.model.Header
+import com.zkrallah.zhttp.client.ZHttpClient
+
+class TaskRepositoryImpl(
+    private val zHttpClient: ZHttpClient,
+    private val dataStore: DataStore
+) : TaskRepository {
+    override suspend fun getUserRole(): String {
+        return dataStore.getUserModel().authorities?.get(0)?.name ?: "STUDENT"
+    }
+
+    override suspend fun getTask(taskId: Long): ApiResponse<Task?>? {
+        val token = dataStore.getToken()
+        val headers = listOf(
+            Header("Authorization", "Bearer $token")
+        )
+
+        val apiResponse = zHttpClient.get<ApiResponse<Task?>>(
+            "api/users/task/$taskId", headers = headers
+        )
+
+        return apiResponse?.body
+    }
+
+    override suspend fun addSource(taskId: Long, source: String): ApiResponse<Source?>? {
+        val token = dataStore.getToken()
+        val headers = listOf(
+            Header("Authorization", "Bearer $token")
+        )
+
+        val sourceDto = SourceDto(source)
+
+        val apiResponse = zHttpClient.post<ApiResponse<Source?>>(
+            "api/teachers/task/$taskId/create-source", body = sourceDto, headers = headers
+        )
+
+        return apiResponse?.body
+    }
+
+    override suspend fun getTaskSubmissions(taskId: Long): ApiResponse<List<Submission>?>? {
+        val token = dataStore.getToken()
+        val headers = listOf(
+            Header("Authorization", "Bearer $token")
+        )
+        val apiResponse = zHttpClient.get<ApiResponse<List<Submission>?>>(
+            "api/teachers/task/$taskId/submissions", headers = headers
+        )
+
+        return apiResponse?.body
+    }
+
+    override suspend fun updateSubmission(
+        submissionId: Long, link: String, grade: Int, additional: String
+    ): ApiResponse<Submission?>? {
+        val token = dataStore.getToken()
+        val headers = listOf(
+            Header("Authorization", "Bearer $token")
+        )
+
+        val submissionDto = SubmissionDto(link, additional, grade)
+
+        val apiResponse = zHttpClient.put<ApiResponse<Submission?>>(
+            "api/teachers/update-submission/$submissionId", body = submissionDto, headers = headers
+        )
+
+        return apiResponse?.body
+    }
+
+    override suspend fun addSubmission(
+        taskId: Long, link: String, additional: String
+    ): ApiResponse<Submission?>? {
+        val token = dataStore.getToken()
+        val headers = listOf(
+            Header("Authorization", "Bearer $token")
+        )
+        val userId = dataStore.getUserModel().id
+
+        val submissionDto = SubmissionDto(link, additional, 0)
+
+        val apiResponse = zHttpClient.post<ApiResponse<Submission?>>(
+            "api/students/submit/$userId/$taskId", body = submissionDto, headers = headers
+        )
+
+        return apiResponse?.body
+    }
+
+    override suspend fun getUserTaskSubmissions(taskId: Long): ApiResponse<List<Submission>?>? {
+        val token = dataStore.getToken()
+        val headers = listOf(
+            Header("Authorization", "Bearer $token")
+        )
+        val userId = dataStore.getUserModel().id
+
+        val apiResponse = zHttpClient.get<ApiResponse<List<Submission>?>>(
+            "api/students/submissions/$taskId/$userId", headers = headers
+        )
+
+        return apiResponse?.body
+    }
+}
