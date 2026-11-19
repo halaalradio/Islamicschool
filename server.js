@@ -1,22 +1,26 @@
 /**
- * IslamicSchool Node.js API
- * Route-compatible starter for the Android app in the supplied ZIP.
- *
- * IMPORTANT:
- * - This starter uses in-memory storage. Data resets on server restart.
- * - Verification codes are logged to the server console (development only).
- * - Configure a persistent database and real email provider before production use.
+ * IslamicSchool Node.js API (PostgreSQL / Supabase)
  */
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET_BEFORE_DEPLOYMENT";
 const TOKEN_EXPIRES_IN = "7d";
+
+if (!process.env.DATABASE_URL) {
+  console.warn("WARNING: DATABASE_URL environment variable is not set.");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -26,64 +30,58 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 }
 });
 
-// Temporary in-memory stores. Replace with PostgreSQL before production.
-const users = [];
-const classes = [];
-const requests = [];
-const announcements = [];
-const tasks = [];
-const sources = [];
-const submissions = [];
-
-let nextUserId = 1;
-let nextClassId = 1;
-let nextRequestId = 1;
-let nextAnnouncementId = 1;
-let nextTaskId = 1;
-let nextSourceId = 1;
-let nextSubmissionId = 1;
-
 const ok = (res, data = null, message = "Success", status = 200) =>
   res.status(status).json({ success: true, message, data });
 
 const fail = (res, status, message) =>
   res.status(status).json({ success: false, message, data: null });
 
-function publicUser(user) {
-  if (!user) return null;
-  const { passwordHash, verificationCode, resetCode, ...safe } = user;
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+function publicUser(row) {
+  if (!row) return null;
   return {
-    ...safe,
-    username: safe.email,
-    authorities: [{ name: safe.role }],
+    id: row.id,
+    email: row.email,
+    firstName: row.first_name || "",
+    lastName: row.last_name || "",
+    dob: row.dob || null,
+    imageUrl: row.image_url || null,
+    role: row.role,
+    emailVerified: !!row.email_verified,
+    createdAt: row.created_at,
+    username: row.email,
+    authorities: [{ name: row.role }],
     accountNonExpired: true,
     accountNonLocked: true,
     credentialsNonExpired: true,
-    enabled: !!safe.emailVerified
+    enabled: !!row.email_verified
   };
 }
 
-function tokenFor(user) {
+function tokenFor(userRow) {
   return jwt.sign(
-    { id: user.id, email: user.email, role: user.role },
+    { id: userRow.id, email: userRow.email, role: userRow.role },
     JWT_SECRET,
     { expiresIn: TOKEN_EXPIRES_IN }
   );
 }
 
-function auth(req, res, next) {
+const auth = asyncHandler(async (req, res, next) => {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return fail(res, 401, "Authorization token is required");
   try {
     req.auth = jwt.verify(token, JWT_SECRET);
-    req.user = users.find(u => u.id === Number(req.auth.id));
-    if (!req.user) return fail(res, 401, "User not found");
-    next();
   } catch {
     return fail(res, 401, "Invalid or expired token");
   }
-}
+  const { rows } = await pool.query("SELECT * FROM users WHERE id = $1", [Number(req.auth.id)]);
+  if (!rows[0]) return fail(res, 401, "User not found");
+  req.user = rows[0];
+  next();
+});
 
 function roles(...allowed) {
   return (req, res, next) => {
@@ -92,307 +90,511 @@ function roles(...allowed) {
   };
 }
 
-function findClass(id) {
-  return classes.find(c => c.id === Number(id));
-}
-function memberOf(classId, userId) {
-  const c = findClass(classId);
-  return !!c && c.memberIds.includes(Number(userId));
-}
-function classView(c) {
+async function getClassWithCount(classId) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name, c.description, COUNT(cm.user_id)::int AS number_of_users
+     FROM classes c
+     LEFT JOIN class_members cm ON cm.class_id = c.id
+     WHERE c.id = $1
+     GROUP BY c.id`,
+    [Number(classId)]
+  );
+  if (!rows[0]) return null;
   return {
-    id: c.id, name: c.name, description: c.description,
-    numberOfUsers: c.memberIds.length
+    id: rows[0].id,
+    name: rows[0].name,
+    description: rows[0].description,
+    numberOfUsers: rows[0].number_of_users
   };
 }
-function taskView(t) {
-  return {
-    id: t.id, title: t.title, description: t.description, due: t.due,
-    sources: sources.filter(s => s.taskId === t.id).map(s => ({ id: s.id, source: s.source })),
-    targetedClass: classView(findClass(t.classId))
-  };
-}
-function requestView(r) {
-  return {
+
+async function listClassesWithCount(whereSql = "", params = []) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.name, c.description, COUNT(cm.user_id)::int AS number_of_users
+     FROM classes c
+     LEFT JOIN class_members cm ON cm.class_id = c.id
+     ${whereSql}
+     GROUP BY c.id
+     ORDER BY c.id ASC`,
+    params
+  );
+  return rows.map((r) => ({
     id: r.id,
-    user: publicUser(users.find(u => u.id === r.userId)),
-    requestedClass: classView(findClass(r.classId)),
-    status: r.status,
-    timestamp: r.timestamp
-  };
+    name: r.name,
+    description: r.description,
+    numberOfUsers: r.number_of_users
+  }));
 }
-function announcementView(a) {
-  return {
-    id: a.id, title: a.title, content: a.content,
-    targetedClass: classView(findClass(a.classId))
-  };
+
+async function isMemberOf(classId, userId) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM class_members WHERE class_id = $1 AND user_id = $2",
+    [Number(classId), Number(userId)]
+  );
+  return rows.length > 0;
 }
-function submissionView(s) {
+
+async function buildTaskView(taskRow) {
+  const { rows: srcRows } = await pool.query(
+    "SELECT id, source FROM sources WHERE task_id = $1 ORDER BY id ASC",
+    [taskRow.id]
+  );
+  const targetedClass = await getClassWithCount(taskRow.class_id);
   return {
-    id: s.id,
-    task: taskView(tasks.find(t => t.id === s.taskId)),
-    user: publicUser(users.find(u => u.id === s.userId)),
-    grade: s.grade, additional: s.additional, link: s.link
+    id: taskRow.id,
+    title: taskRow.title,
+    description: taskRow.description,
+    due: taskRow.due,
+    sources: srcRows,
+    targetedClass
   };
 }
 
-app.get("/", (req, res) => ok(res, { service: "IslamicSchool API", status: "running" }, "IslamicSchool Server is running!"));
-app.get("/health", (req, res) => ok(res, { status: "ok" }, "Healthy"));
+async function buildRequestView(reqRow) {
+  const { rows: uRows } = await pool.query("SELECT * FROM users WHERE id = $1", [reqRow.user_id]);
+  const targetedClass = await getClassWithCount(reqRow.class_id);
+  return {
+    id: reqRow.id,
+    user: publicUser(uRows[0]),
+    requestedClass: targetedClass,
+    status: reqRow.status,
+    timestamp: reqRow.timestamp
+  };
+}
 
-// AUTH: signup
-async function signup(req, res, role) {
+async function buildAnnouncementView(annRow) {
+  const targetedClass = await getClassWithCount(annRow.class_id);
+  return {
+    id: annRow.id,
+    title: annRow.title,
+    content: annRow.content,
+    targetedClass
+  };
+}
+
+async function buildSubmissionView(subRow) {
+  const { rows: tRows } = await pool.query("SELECT * FROM tasks WHERE id = $1", [subRow.task_id]);
+  const { rows: uRows } = await pool.query("SELECT * FROM users WHERE id = $1", [subRow.user_id]);
+  return {
+    id: subRow.id,
+    task: tRows[0] ? await buildTaskView(tRows[0]) : null,
+    user: publicUser(uRows[0]),
+    grade: subRow.grade,
+    additional: subRow.additional,
+    link: subRow.link
+  };
+}
+
+app.get("/", (req, res) =>
+  ok(res, { service: "IslamicSchool API", status: "running" }, "IslamicSchool Server is running!")
+);
+app.get("/health", asyncHandler(async (req, res) => {
+  await pool.query("SELECT 1");
+  return ok(res, { status: "ok", database: "connected" }, "Healthy");
+}));
+
+// AUTH
+async function handleSignup(req, res, role) {
   const { email, password, firstName, lastName } = req.body || {};
   if (!email || !password || String(password).length < 8) {
     return fail(res, 400, "Email and password (at least 8 characters) are required");
   }
   const normalized = String(email).trim().toLowerCase();
-  if (users.some(u => u.email === normalized)) return fail(res, 409, "Email is already registered");
+  const exists = await pool.query("SELECT id FROM users WHERE email = $1", [normalized]);
+  if (exists.rows.length > 0) return fail(res, 409, "Email is already registered");
 
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  const user = {
-    id: nextUserId++, email: normalized,
-    passwordHash: await bcrypt.hash(String(password), 12),
-    firstName: firstName || "", lastName: lastName || "",
-    dob: null, imageUrl: null, role, emailVerified: false,
-    verificationCode: code, verificationExpiresAt: Date.now() + 15 * 60 * 1000,
-    createdAt: new Date().toISOString()
-  };
-  users.push(user);
+  const passwordHash = await bcrypt.hash(String(password), 12);
+  const expiresAt = Date.now() + 15 * 60 * 1000;
 
-  // Development only until an email provider is configured.
+  const { rows } = await pool.query(
+    `INSERT INTO users (email, password_hash, first_name, last_name, role, email_verified, verification_code, verification_expires_at)
+     VALUES ($1, $2, $3, $4, $5, FALSE, $6, $7)
+     RETURNING *`,
+    [normalized, passwordHash, firstName || "", lastName || "", role, code, expiresAt]
+  );
+
   console.log(`[IslamicSchool DEV] Verification code for ${normalized}: ${code}`);
-  return ok(res, publicUser(user), "Registration successful. Check server logs for the development verification code.", 201);
+  return ok(
+    res,
+    publicUser(rows[0]),
+    "Registration successful. Check server logs for the development verification code.",
+    201
+  );
 }
-app.post("/api/auth/student/signup", (req, res) => signup(req, res, "STUDENT"));
-app.post("/api/auth/teacher/signup", (req, res) => signup(req, res, "TEACHER"));
 
-app.post("/api/auth/verify-code", (req, res) => {
+app.post("/api/auth/student/signup", asyncHandler((req, res) => handleSignup(req, res, "STUDENT")));
+app.post("/api/auth/teacher/signup", asyncHandler((req, res) => handleSignup(req, res, "TEACHER")));
+
+app.post("/api/auth/verify-code", asyncHandler(async (req, res) => {
   const { email, code } = req.body || {};
-  const user = users.find(u => u.email === String(email || "").trim().toLowerCase());
+  const normalized = String(email || "").trim().toLowerCase();
+  const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [normalized]);
+  const user = rows[0];
   if (!user) return fail(res, 404, "User not found");
-  if (user.emailVerified) return ok(res, null, "Email already verified");
-  if (!user.verificationCode || Date.now() > user.verificationExpiresAt ||
-      String(user.verificationCode) !== String(code)) return fail(res, 400, "Invalid or expired verification code");
-  user.emailVerified = true;
-  user.verificationCode = null;
+  if (user.email_verified) return ok(res, null, "Email already verified");
+  if (
+    !user.verification_code ||
+    Date.now() > Number(user.verification_expires_at) ||
+    String(user.verification_code) !== String(code)
+  ) {
+    return fail(res, 400, "Invalid or expired verification code");
+  }
+  await pool.query(
+    "UPDATE users SET email_verified = TRUE, verification_code = NULL WHERE id = $1",
+    [user.id]
+  );
   return ok(res, null, "Email verified successfully");
-});
+}));
 
-app.post("/api/auth/regenerate-code", (req, res) => {
+app.post("/api/auth/regenerate-code", asyncHandler(async (req, res) => {
   const { email } = req.body || {};
-  const user = users.find(u => u.email === String(email || "").trim().toLowerCase());
+  const normalized = String(email || "").trim().toLowerCase();
+  const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [normalized]);
+  const user = rows[0];
   if (!user) return fail(res, 404, "User not found");
-  if (user.emailVerified) return fail(res, 400, "Email is already verified");
-  user.verificationCode = String(Math.floor(100000 + Math.random() * 900000));
-  user.verificationExpiresAt = Date.now() + 15 * 60 * 1000;
-  console.log(`[IslamicSchool DEV] New verification code for ${user.email}: ${user.verificationCode}`);
+  if (user.email_verified) return fail(res, 400, "Email is already verified");
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = Date.now() + 15 * 60 * 1000;
+  await pool.query(
+    "UPDATE users SET verification_code = $1, verification_expires_at = $2 WHERE id = $3",
+    [code, expiresAt, user.id]
+  );
+  console.log(`[IslamicSchool DEV] New verification code for ${user.email}: ${code}`);
   return ok(res, null, "A new verification code was generated. Check server logs.");
-});
+}));
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
-  const user = users.find(u => u.email === String(email || "").trim().toLowerCase());
-  if (!user || !(await bcrypt.compare(String(password || ""), user.passwordHash))) {
+  const normalized = String(email || "").trim().toLowerCase();
+  const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [normalized]);
+  const user = rows[0];
+  if (!user || !(await bcrypt.compare(String(password || ""), user.password_hash))) {
     return fail(res, 401, "Invalid email or password");
   }
-  if (!user.emailVerified) return fail(res, 403, "Please verify your email first");
+  if (!user.email_verified) return fail(res, 403, "Please verify your email first");
   return ok(res, { token: tokenFor(user), user: publicUser(user) }, "Login successful");
-});
+}));
 
-app.post("/api/auth/reset-password", async (req, res) => {
+app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
   const { email, password, code } = req.body || {};
-  const user = users.find(u => u.email === String(email || "").trim().toLowerCase());
+  const normalized = String(email || "").trim().toLowerCase();
+  const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [normalized]);
+  const user = rows[0];
   if (!user) return fail(res, 404, "User not found");
-  if (!user.resetCode || Date.now() > user.resetExpiresAt || String(code) !== user.resetCode) {
+  if (
+    !user.reset_code ||
+    Date.now() > Number(user.reset_expires_at) ||
+    String(code) !== String(user.reset_code)
+  ) {
     return fail(res, 400, "Invalid or expired reset code");
   }
-  if (!password || String(password).length < 8) return fail(res, 400, "Password must be at least 8 characters");
-  user.passwordHash = await bcrypt.hash(String(password), 12);
-  user.resetCode = null;
+  if (!password || String(password).length < 8) {
+    return fail(res, 400, "Password must be at least 8 characters");
+  }
+  const passwordHash = await bcrypt.hash(String(password), 12);
+  await pool.query(
+    "UPDATE users SET password_hash = $1, reset_code = NULL WHERE id = $2",
+    [passwordHash, user.id]
+  );
   return ok(res, null, "Password reset successfully");
-});
+}));
 
-// No reset-code request route exists in the supplied Android source.
-// This route is provided so a future reset screen can request a code.
-app.post("/api/auth/request-reset-code", (req, res) => {
+app.post("/api/auth/request-reset-code", asyncHandler(async (req, res) => {
   const { email } = req.body || {};
-  const user = users.find(u => u.email === String(email || "").trim().toLowerCase());
+  const normalized = String(email || "").trim().toLowerCase();
+  const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [normalized]);
+  const user = rows[0];
   if (!user) return fail(res, 404, "User not found");
-  user.resetCode = String(Math.floor(100000 + Math.random() * 900000));
-  user.resetExpiresAt = Date.now() + 15 * 60 * 1000;
-  console.log(`[IslamicSchool DEV] Password reset code for ${user.email}: ${user.resetCode}`);
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = Date.now() + 15 * 60 * 1000;
+  await pool.query(
+    "UPDATE users SET reset_code = $1, reset_expires_at = $2 WHERE id = $3",
+    [code, expiresAt, user.id]
+  );
+  console.log(`[IslamicSchool DEV] Password reset code for ${user.email}: ${code}`);
   return ok(res, null, "Reset code generated. Check server logs.");
-});
+}));
 
-// Classes / browse
-app.get("/api/classes", auth, (req, res) => ok(res, classes.map(classView)));
-app.post("/api/admin/create-class", auth, roles("ADMIN"), (req, res) => {
+// CLASSES
+app.get("/api/classes", auth, asyncHandler(async (req, res) => {
+  return ok(res, await listClassesWithCount());
+}));
+
+app.post("/api/admin/create-class", auth, roles("ADMIN"), asyncHandler(async (req, res) => {
   const { name, description } = req.body || {};
   if (!name) return fail(res, 400, "Class name is required");
-  const c = { id: nextClassId++, name, description: description || "", memberIds: [req.user.id] };
-  classes.push(c);
-  return ok(res, classView(c), "Class created", 201);
-});
+  const { rows } = await pool.query(
+    "INSERT INTO classes (name, description) VALUES ($1, $2) RETURNING id",
+    [name, description || ""]
+  );
+  const classId = rows[0].id;
+  await pool.query(
+    "INSERT INTO class_members (class_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    [classId, req.user.id]
+  );
+  return ok(res, await getClassWithCount(classId), "Class created", 201);
+}));
 
-app.post("/api/users/request/:userId/to/:classId", auth, (req, res) => {
-  const userId = Number(req.params.userId), classId = Number(req.params.classId);
+app.post("/api/users/request/:userId/to/:classId", auth, asyncHandler(async (req, res) => {
+  const userId = Number(req.params.userId);
+  const classId = Number(req.params.classId);
   if (req.user.id !== userId && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
-  if (!findClass(classId)) return fail(res, 404, "Class not found");
-  if (requests.some(r => r.userId === userId && r.classId === classId && r.status === "PENDING")) {
-    return fail(res, 409, "Request already pending");
+  const cls = await getClassWithCount(classId);
+  if (!cls) return fail(res, 404, "Class not found");
+
+  const pending = await pool.query(
+    "SELECT id FROM requests WHERE user_id = $1 AND class_id = $2 AND status = 'PENDING'",
+    [userId, classId]
+  );
+  if (pending.rows.length > 0) return fail(res, 409, "Request already pending");
+
+  const { rows } = await pool.query(
+    "INSERT INTO requests (user_id, class_id, status) VALUES ($1, $2, 'PENDING') RETURNING *",
+    [userId, classId]
+  );
+  return ok(res, await buildRequestView(rows[0]), "Request submitted", 201);
+}));
+
+app.get("/api/users/:userId/classes", auth, asyncHandler(async (req, res) => {
+  const id = Number(req.params.userId);
+  if (req.user.id !== id && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
+  return ok(
+    res,
+    await listClassesWithCount(
+      "WHERE c.id IN (SELECT class_id FROM class_members WHERE user_id = $1)",
+      [id]
+    )
+  );
+}));
+
+app.get("/api/users/:userId/requests", auth, asyncHandler(async (req, res) => {
+  const id = Number(req.params.userId);
+  if (req.user.id !== id && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
+  const { rows } = await pool.query("SELECT * FROM requests WHERE user_id = $1 ORDER BY id DESC", [id]);
+  const views = await Promise.all(rows.map(buildRequestView));
+  return ok(res, views);
+}));
+
+app.get("/api/classes/:classId/users", auth, asyncHandler(async (req, res) => {
+  const classId = Number(req.params.classId);
+  const cls = await getClassWithCount(classId);
+  if (!cls) return fail(res, 404, "Class not found");
+  if (!(await isMemberOf(classId, req.user.id)) && req.user.role !== "ADMIN") {
+    return fail(res, 403, "Not a class member");
   }
-  const r = { id: nextRequestId++, userId, classId, status: "PENDING", timestamp: new Date().toISOString() };
-  requests.push(r);
-  return ok(res, requestView(r), "Request submitted", 201);
-});
+  const { rows } = await pool.query(
+    `SELECT u.* FROM users u
+     INNER JOIN class_members cm ON cm.user_id = u.id
+     WHERE cm.class_id = $1
+     ORDER BY u.id ASC`,
+    [classId]
+  );
+  return ok(res, rows.map(publicUser));
+}));
 
-app.get("/api/users/:userId/classes", auth, (req, res) => {
-  const id = Number(req.params.userId);
-  if (req.user.id !== id && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
-  return ok(res, classes.filter(c => c.memberIds.includes(id)).map(classView));
-});
-app.get("/api/users/:userId/requests", auth, (req, res) => {
-  const id = Number(req.params.userId);
-  if (req.user.id !== id && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
-  return ok(res, requests.filter(r => r.userId === id).map(requestView));
-});
-app.get("/api/classes/:classId/users", auth, (req, res) => {
-  const c = findClass(req.params.classId);
-  if (!c) return fail(res, 404, "Class not found");
-  if (!memberOf(c.id, req.user.id) && req.user.role !== "ADMIN") return fail(res, 403, "Not a class member");
-  return ok(res, c.memberIds.map(id => publicUser(users.find(u => u.id === id))).filter(Boolean));
-});
-app.get("/api/classes/:classId/announcements", auth, (req, res) => {
-  const c = findClass(req.params.classId);
-  if (!c) return fail(res, 404, "Class not found");
-  if (!memberOf(c.id, req.user.id) && req.user.role !== "ADMIN") return fail(res, 403, "Not a class member");
-  return ok(res, announcements.filter(a => a.classId === c.id).map(announcementView));
-});
-app.get("/api/classes/:classId/tasks", auth, (req, res) => {
-  const c = findClass(req.params.classId);
-  if (!c) return fail(res, 404, "Class not found");
-  if (!memberOf(c.id, req.user.id) && req.user.role !== "ADMIN") return fail(res, 403, "Not a class member");
-  return ok(res, tasks.filter(t => t.classId === c.id).map(taskView));
-});
-app.get("/api/classes/:classId/requests", auth, roles("ADMIN", "TEACHER"), (req, res) => {
-  const c = findClass(req.params.classId);
-  if (!c) return fail(res, 404, "Class not found");
-  return ok(res, requests.filter(r => r.classId === c.id).map(requestView));
-});
+app.get("/api/classes/:classId/announcements", auth, asyncHandler(async (req, res) => {
+  const classId = Number(req.params.classId);
+  const cls = await getClassWithCount(classId);
+  if (!cls) return fail(res, 404, "Class not found");
+  if (!(await isMemberOf(classId, req.user.id)) && req.user.role !== "ADMIN") {
+    return fail(res, 403, "Not a class member");
+  }
+  const { rows } = await pool.query("SELECT * FROM announcements WHERE class_id = $1 ORDER BY id DESC", [classId]);
+  return ok(res, await Promise.all(rows.map(buildAnnouncementView)));
+}));
 
-app.put("/api/admin/approve-request/:requestId", auth, roles("ADMIN"), (req, res) => {
-  const r = requests.find(x => x.id === Number(req.params.requestId));
-  if (!r) return fail(res, 404, "Request not found");
-  r.status = "APPROVED";
-  const c = findClass(r.classId);
-  if (c && !c.memberIds.includes(r.userId)) c.memberIds.push(r.userId);
-  return ok(res, requestView(r), "Request approved");
-});
-app.put("/api/admin/decline-request/:requestId", auth, roles("ADMIN"), (req, res) => {
-  const r = requests.find(x => x.id === Number(req.params.requestId));
-  if (!r) return fail(res, 404, "Request not found");
-  r.status = "DECLINED";
-  return ok(res, requestView(r), "Request declined");
-});
+app.get("/api/classes/:classId/tasks", auth, asyncHandler(async (req, res) => {
+  const classId = Number(req.params.classId);
+  const cls = await getClassWithCount(classId);
+  if (!cls) return fail(res, 404, "Class not found");
+  if (!(await isMemberOf(classId, req.user.id)) && req.user.role !== "ADMIN") {
+    return fail(res, 403, "Not a class member");
+  }
+  const { rows } = await pool.query("SELECT * FROM tasks WHERE class_id = $1 ORDER BY id DESC", [classId]);
+  return ok(res, await Promise.all(rows.map(buildTaskView)));
+}));
 
-// Teachers: tasks, announcements, sources
-app.post("/api/teachers/class/:classId/create-task", auth, roles("ADMIN", "TEACHER"), (req, res) => {
-  const c = findClass(req.params.classId);
-  if (!c) return fail(res, 404, "Class not found");
+app.get("/api/classes/:classId/requests", auth, roles("ADMIN", "TEACHER"), asyncHandler(async (req, res) => {
+  const classId = Number(req.params.classId);
+  const cls = await getClassWithCount(classId);
+  if (!cls) return fail(res, 404, "Class not found");
+  const { rows } = await pool.query("SELECT * FROM requests WHERE class_id = $1 ORDER BY id DESC", [classId]);
+  return ok(res, await Promise.all(rows.map(buildRequestView)));
+}));
+
+app.put("/api/admin/approve-request/:requestId", auth, roles("ADMIN"), asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    "UPDATE requests SET status = 'APPROVED' WHERE id = $1 RETURNING *",
+    [Number(req.params.requestId)]
+  );
+  if (!rows[0]) return fail(res, 404, "Request not found");
+  await pool.query(
+    "INSERT INTO class_members (class_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    [rows[0].class_id, rows[0].user_id]
+  );
+  return ok(res, await buildRequestView(rows[0]), "Request approved");
+}));
+
+app.put("/api/admin/decline-request/:requestId", auth, roles("ADMIN"), asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    "UPDATE requests SET status = 'DECLINED' WHERE id = $1 RETURNING *",
+    [Number(req.params.requestId)]
+  );
+  if (!rows[0]) return fail(res, 404, "Request not found");
+  return ok(res, await buildRequestView(rows[0]), "Request declined");
+}));
+
+// TEACHERS
+app.post("/api/teachers/class/:classId/create-task", auth, roles("ADMIN", "TEACHER"), asyncHandler(async (req, res) => {
+  const classId = Number(req.params.classId);
+  const cls = await getClassWithCount(classId);
+  if (!cls) return fail(res, 404, "Class not found");
   const { title, description, due } = req.body || {};
   if (!title) return fail(res, 400, "Task title is required");
-  const t = { id: nextTaskId++, classId: c.id, title, description: description || "", due: due || null };
-  tasks.push(t);
-  return ok(res, taskView(t), "Task created", 201);
-});
-app.post("/api/teachers/create-announcement/:classId", auth, roles("ADMIN", "TEACHER"), (req, res) => {
-  const c = findClass(req.params.classId);
-  if (!c) return fail(res, 404, "Class not found");
+  const { rows } = await pool.query(
+    "INSERT INTO tasks (class_id, title, description, due) VALUES ($1, $2, $3, $4) RETURNING *",
+    [classId, title, description || "", due || null]
+  );
+  return ok(res, await buildTaskView(rows[0]), "Task created", 201);
+}));
+
+app.post("/api/teachers/create-announcement/:classId", auth, roles("ADMIN", "TEACHER"), asyncHandler(async (req, res) => {
+  const classId = Number(req.params.classId);
+  const cls = await getClassWithCount(classId);
+  if (!cls) return fail(res, 404, "Class not found");
   const { title, content } = req.body || {};
   if (!title || !content) return fail(res, 400, "Title and content are required");
-  const a = { id: nextAnnouncementId++, classId: c.id, title, content };
-  announcements.push(a);
-  return ok(res, announcementView(a), "Announcement created", 201);
-});
-app.post("/api/teachers/task/:taskId/create-source", auth, roles("ADMIN", "TEACHER"), (req, res) => {
-  const t = tasks.find(x => x.id === Number(req.params.taskId));
-  if (!t) return fail(res, 404, "Task not found");
+  const { rows } = await pool.query(
+    "INSERT INTO announcements (class_id, title, content) VALUES ($1, $2, $3) RETURNING *",
+    [classId, title, content]
+  );
+  return ok(res, await buildAnnouncementView(rows[0]), "Announcement created", 201);
+}));
+
+app.post("/api/teachers/task/:taskId/create-source", auth, roles("ADMIN", "TEACHER"), asyncHandler(async (req, res) => {
+  const taskId = Number(req.params.taskId);
+  const tRes = await pool.query("SELECT id FROM tasks WHERE id = $1", [taskId]);
+  if (!tRes.rows[0]) return fail(res, 404, "Task not found");
   const { source } = req.body || {};
   if (!source) return fail(res, 400, "Source is required");
-  const item = { id: nextSourceId++, taskId: t.id, source };
-  sources.push(item);
-  return ok(res, item, "Source added", 201);
-});
-app.get("/api/users/task/:taskId", auth, (req, res) => {
-  const t = tasks.find(x => x.id === Number(req.params.taskId));
-  if (!t) return fail(res, 404, "Task not found");
-  if (!memberOf(t.classId, req.user.id) && req.user.role !== "ADMIN") return fail(res, 403, "Not a class member");
-  return ok(res, taskView(t));
-});
+  const { rows } = await pool.query(
+    "INSERT INTO sources (task_id, source) VALUES ($1, $2) RETURNING id, source",
+    [taskId, source]
+  );
+  return ok(res, rows[0], "Source added", 201);
+}));
 
-// Submissions
-app.post("/api/students/submit/:userId/:taskId", auth, (req, res) => {
-  const userId = Number(req.params.userId), taskId = Number(req.params.taskId);
-  if (req.user.id !== userId && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
-  const task = tasks.find(t => t.id === taskId);
+app.get("/api/users/task/:taskId", auth, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM tasks WHERE id = $1", [Number(req.params.taskId)]);
+  const task = rows[0];
   if (!task) return fail(res, 404, "Task not found");
-  if (!memberOf(task.classId, userId)) return fail(res, 403, "Not a class member");
-  const { link, additional } = req.body || {};
-  const existing = submissions.find(s => s.userId === userId && s.taskId === taskId);
-  if (existing) {
-    existing.link = link || null; existing.additional = additional || null;
-    return ok(res, submissionView(existing), "Submission updated");
+  if (!(await isMemberOf(task.class_id, req.user.id)) && req.user.role !== "ADMIN") {
+    return fail(res, 403, "Not a class member");
   }
-  const s = { id: nextSubmissionId++, userId, taskId, link: link || null, additional: additional || null, grade: null };
-  submissions.push(s);
-  return ok(res, submissionView(s), "Submission created", 201);
-});
-app.get("/api/students/submissions/:taskId/:userId", auth, (req, res) => {
-  const userId = Number(req.params.userId);
-  if (req.user.id !== userId && req.user.role !== "ADMIN" && req.user.role !== "TEACHER") return fail(res, 403, "Not allowed");
-  return ok(res, submissions.filter(s => s.taskId === Number(req.params.taskId) && s.userId === userId).map(submissionView));
-});
-app.get("/api/teachers/task/:taskId/submissions", auth, roles("ADMIN", "TEACHER"), (req, res) => {
-  const taskId = Number(req.params.taskId);
-  if (!tasks.some(t => t.id === taskId)) return fail(res, 404, "Task not found");
-  return ok(res, submissions.filter(s => s.taskId === taskId).map(submissionView));
-});
-app.put("/api/teachers/update-submission/:submissionId", auth, roles("ADMIN", "TEACHER"), (req, res) => {
-  const s = submissions.find(x => x.id === Number(req.params.submissionId));
-  if (!s) return fail(res, 404, "Submission not found");
-  const { grade, additional, link } = req.body || {};
-  if (grade !== undefined) s.grade = Number(grade);
-  if (additional !== undefined) s.additional = additional;
-  if (link !== undefined) s.link = link;
-  return ok(res, submissionView(s), "Submission updated");
-});
+  return ok(res, await buildTaskView(task));
+}));
 
-// User profile
-app.get("/api/users/:userId", auth, (req, res) => {
+// SUBMISSIONS
+app.post("/api/students/submit/:userId/:taskId", auth, asyncHandler(async (req, res) => {
+  const userId = Number(req.params.userId);
+  const taskId = Number(req.params.taskId);
+  if (req.user.id !== userId && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
+  const tRes = await pool.query("SELECT * FROM tasks WHERE id = $1", [taskId]);
+  const task = tRes.rows[0];
+  if (!task) return fail(res, 404, "Task not found");
+  if (!(await isMemberOf(task.class_id, userId))) return fail(res, 403, "Not a class member");
+
+  const { link, additional } = req.body || {};
+  const { rows } = await pool.query(
+    `INSERT INTO submissions (task_id, user_id, link, additional, grade)
+     VALUES ($1, $2, $3, $4, NULL)
+     ON CONFLICT (task_id, user_id)
+     DO UPDATE SET link = EXCLUDED.link, additional = EXCLUDED.additional
+     RETURNING *`,
+    [taskId, userId, link || null, additional || null]
+  );
+  return ok(res, await buildSubmissionView(rows[0]), "Submission saved", 201);
+}));
+
+app.get("/api/students/submissions/:taskId/:userId", auth, asyncHandler(async (req, res) => {
+  const userId = Number(req.params.userId);
+  const taskId = Number(req.params.taskId);
+  if (req.user.id !== userId && req.user.role !== "ADMIN" && req.user.role !== "TEACHER") {
+    return fail(res, 403, "Not allowed");
+  }
+  const { rows } = await pool.query(
+    "SELECT * FROM submissions WHERE task_id = $1 AND user_id = $2",
+    [taskId, userId]
+  );
+  return ok(res, await Promise.all(rows.map(buildSubmissionView)));
+}));
+
+app.get("/api/teachers/task/:taskId/submissions", auth, roles("ADMIN", "TEACHER"), asyncHandler(async (req, res) => {
+  const taskId = Number(req.params.taskId);
+  const tRes = await pool.query("SELECT id FROM tasks WHERE id = $1", [taskId]);
+  if (!tRes.rows[0]) return fail(res, 404, "Task not found");
+  const { rows } = await pool.query("SELECT * FROM submissions WHERE task_id = $1 ORDER BY id ASC", [taskId]);
+  return ok(res, await Promise.all(rows.map(buildSubmissionView)));
+}));
+
+app.put("/api/teachers/update-submission/:submissionId", auth, roles("ADMIN", "TEACHER"), asyncHandler(async (req, res) => {
+  const subId = Number(req.params.submissionId);
+  const { rows: existingRows } = await pool.query("SELECT * FROM submissions WHERE id = $1", [subId]);
+  const existing = existingRows[0];
+  if (!existing) return fail(res, 404, "Submission not found");
+
+  const { grade, additional, link } = req.body || {};
+  const nextGrade = grade !== undefined ? Number(grade) : existing.grade;
+  const nextAdditional = additional !== undefined ? additional : existing.additional;
+  const nextLink = link !== undefined ? link : existing.link;
+
+  const { rows } = await pool.query(
+    "UPDATE submissions SET grade = $1, additional = $2, link = $3 WHERE id = $4 RETURNING *",
+    [nextGrade, nextAdditional, nextLink, subId]
+  );
+  return ok(res, await buildSubmissionView(rows[0]), "Submission updated");
+}));
+
+// USER PROFILE
+app.get("/api/users/:userId", auth, asyncHandler(async (req, res) => {
   const id = Number(req.params.userId);
   if (req.user.id !== id && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
-  return ok(res, publicUser(req.user.id === id ? req.user : users.find(u => u.id === id)));
-});
-app.put("/api/users/update-user/:userId", auth, (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
+  return ok(res, publicUser(rows[0]));
+}));
+
+app.put("/api/users/update-user/:userId", auth, asyncHandler(async (req, res) => {
   const id = Number(req.params.userId);
   if (req.user.id !== id && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
-  const user = users.find(u => u.id === id);
-  if (!user) return fail(res, 404, "User not found");
+  const { rows: existingRows } = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
+  const existing = existingRows[0];
+  if (!existing) return fail(res, 404, "User not found");
+
   const { firstName, lastName, dob } = req.body || {};
-  if (firstName !== undefined) user.firstName = firstName;
-  if (lastName !== undefined) user.lastName = lastName;
-  if (dob !== undefined) user.dob = dob;
-  return ok(res, publicUser(user), "Profile updated");
-});
-app.post("/api/users/:userId/upload-image", auth, upload.single("file"), (req, res) => {
+  const nextFirst = firstName !== undefined ? firstName : existing.first_name;
+  const nextLast = lastName !== undefined ? lastName : existing.last_name;
+  const nextDob = dob !== undefined ? dob : existing.dob;
+
+  const { rows } = await pool.query(
+    "UPDATE users SET first_name = $1, last_name = $2, dob = $3 WHERE id = $4 RETURNING *",
+    [nextFirst, nextLast, nextDob, id]
+  );
+  return ok(res, publicUser(rows[0]), "Profile updated");
+}));
+
+app.post("/api/users/:userId/upload-image", auth, upload.single("file"), asyncHandler(async (req, res) => {
   const id = Number(req.params.userId);
   if (req.user.id !== id && req.user.role !== "ADMIN") return fail(res, 403, "Not allowed");
   if (!req.file) return fail(res, 400, "Image file is required");
-  // This starter acknowledges upload but does not persist image bytes.
-  return ok(res, { fileName: req.file.originalname, size: req.file.size }, "Image received. Configure object storage to persist it.");
-});
+  return ok(
+    res,
+    { fileName: req.file.originalname, size: req.file.size },
+    "Image received. Configure object storage to persist it."
+  );
+}));
 
-// Generic error handler
+// ERROR HANDLER
 app.use((err, req, res, next) => {
   console.error(err);
   if (err instanceof multer.MulterError) return fail(res, 400, err.message);
