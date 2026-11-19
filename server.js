@@ -1,5 +1,3 @@
-
-
 /**
  * IslamicSchool API
  * Node.js + Express + Supabase PostgreSQL
@@ -18,13 +16,19 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// ENVIRONMENT VARIABLES
-const DATABASE_URL = process.env.DATABASE_URL;
+// SUPABASE & ENVIRONMENT VARIABLES
+const SUPABASE_URL =
+  process.env.SUPABASE_URL || "https://hewxmgzajaqwqxcdchvv.supabase.co";
+const DATABASE_URL =
+  process.env.DATABASE_URL ||
+  "postgresql://postgres:[YOUR-DATABASE-PASSWORD]@db.hewxmgzajaqwqxcdchvv.supabase.co:5432/postgres";
 const JWT_SECRET = process.env.JWT_SECRET;
 const TEACHER_SIGNUP_CODE = process.env.TEACHER_SIGNUP_CODE;
 
-if (!DATABASE_URL) {
-  throw new Error("DATABASE_URL environment variable is required");
+if (!DATABASE_URL || DATABASE_URL.includes("[YOUR-DATABASE-PASSWORD]")) {
+  throw new Error(
+    "DATABASE_URL is required and must replace [sb_publishable_n8JdbNxS4jIKfNhMcojCvg_iI0d_8yZ]"
+  );
 }
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
@@ -103,6 +107,7 @@ const upload = multer({
 app.get("/", (req, res) => {
   res.json({
     name: "IslamicSchool API",
+    supabaseUrl: SUPABASE_URL,
     status: "running"
   });
 });
@@ -751,7 +756,7 @@ app.put("/api/submissions/:id/grade", auth, allow("ADMIN", "TEACHER"),
 
 // IMAGE UPLOAD
 // This endpoint returns a temporary response only.
-// Use Supabase Storage for permanent file storage.
+// Use Supabase Storage (${SUPABASE_URL}) for permanent file storage.
 app.post("/api/upload", auth, upload.single("image"), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "Image file required" });
@@ -759,7 +764,7 @@ app.post("/api/upload", auth, upload.single("image"), (req, res) => {
 
   res.status(501).json({
     error: "Permanent image storage is not configured yet",
-    message: "Configure Supabase Storage before using image uploads"
+    message: `Configure Supabase Storage (${SUPABASE_URL}) before using image uploads`
   });
 });
 
